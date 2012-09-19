@@ -1,0 +1,206 @@
+--- a/kernel/sched/bfs.c	2012-07-02 22:06:55.303582866 +0200
++++ b/kernel/sched/bfs.c	2012-07-02 22:11:12.210247932 +0200
+@@ -84,6 +84,9 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+ 
++#undef PRIO_LIMIT
++#define PRIO_LIMIT 143
++
+ #define rt_prio(prio)		unlikely((prio) < MAX_RT_PRIO)
+ #define rt_task(p)		rt_prio((p)->prio)
+ #define rt_queue(rq)		rt_prio((rq)->rq_prio)
+@@ -131,7 +134,7 @@
+ #define NS_TO_MS(TIME)		((TIME) >> 20)
+ #define NS_TO_US(TIME)		((TIME) >> 10)
+ 
+-#define RESCHED_US	(100) /* Reschedule if less than this many μs left */
++#define RESCHED_US	(100) /* Reschedule if less than this many 渭s left */
+ 
+ void print_scheduler_version(void)
+ {
+@@ -227,6 +230,8 @@ static struct root_domain def_root_domai
+ 
+ /* There can be only one */
+ static struct global_rq grq;
++struct global_rq *bfs_global_rq = &grq;
++EXPORT_SYMBOL(bfs_global_rq);
+ 
+ /*
+  * This is the main, per-CPU runqueue data structure.
+@@ -680,8 +685,16 @@ static inline bool task_queued(struct ta
+ static void dequeue_task(struct task_struct *p)
+ {
+ 	list_del_init(&p->run_list);
+-	if (list_empty(grq.queue + p->prio))
+-		__clear_bit(p->prio, grq.prio_bitmap);
++	if (p->prio < NORMAL_PRIO) {
++		if (list_empty(grq.queue + p->prio))
++			__clear_bit(p->prio, grq.prio_bitmap);
++	} else if(p->prio == NORMAL_PRIO) {
++		if (list_empty(grq.queue + p->static_prio + 1))
++			__clear_bit(p->static_prio + 1, grq.prio_bitmap);
++	} else {
++		if (list_empty(grq.queue + MAX_PRIO + 1))
++			__clear_bit(MAX_PRIO + 1, grq.prio_bitmap);
++	}
+ }
+ 
+ /*
+@@ -716,16 +729,47 @@ static void enqueue_task(struct task_str
+ 		else
+ 			p->prio = NORMAL_PRIO;
+ 	}
+-	__set_bit(p->prio, grq.prio_bitmap);
+-	list_add_tail(&p->run_list, grq.queue + p->prio);
++	if (p->prio < NORMAL_PRIO)  {
++		__set_bit(p->prio, grq.prio_bitmap);
++		list_add_tail(&p->run_list, grq.queue + p->prio);
++	} else if(p->prio == NORMAL_PRIO) {
++		__set_bit(p->static_prio + 1, grq.prio_bitmap);
++		list_add_tail(&p->run_list, grq.queue + p->static_prio + 1);
++	} else {
++		__set_bit(MAX_PRIO + 1, grq.prio_bitmap);
++		list_add_tail(&p->run_list, grq.queue + MAX_PRIO + 1);
++	}
+ 	sched_info_queued(p);
+ }
+ 
+ /* Only idle task does this as a real time task*/
+ static inline void enqueue_task_head(struct task_struct *p)
+ {
+-	__set_bit(p->prio, grq.prio_bitmap);
+-	list_add(&p->run_list, grq.queue + p->prio);
++	int prio = p->prio;
++	struct list_head *queue;
++	if (!rt_task(p)) {
++		if ((idleprio_task(p) && idleprio_suitable(p)) ||
++		   (iso_task(p) && isoprio_suitable()))
++			p->prio = p->normal_prio;
++		else
++			p->prio = NORMAL_PRIO;
++	}
++
++	if (prio < NORMAL_PRIO)  {
++		queue = grq.queue + prio;
++		__set_bit(prio, grq.prio_bitmap);
++		list_add(&p->run_list, queue);
++	} else if(prio == NORMAL_PRIO) {
++		prio = p->static_prio + 1;
++		queue = grq.queue + prio;
++		__set_bit(prio, grq.prio_bitmap);
++		list_add(&p->run_list, queue);
++	} else {
++		prio = MAX_PRIO + 1;
++		queue = grq.queue + prio;
++		__set_bit(prio, grq.prio_bitmap);
++		list_add(&p->run_list, queue);
++	}
+ 	sched_info_queued(p);
+ }
+ 
+@@ -1589,7 +1633,7 @@ static bool try_to_wake_up(struct task_s
+ 
+ 	get_cpu();
+ 
+-	/* This barrier is undocumented, probably for p->state? くそ */
++	/* This barrier is undocumented, probably for p->state? 銇忋仢 */
+ 	smp_wmb();
+ 
+ 	/*
+@@ -1599,7 +1643,7 @@ static bool try_to_wake_up(struct task_s
+ 	rq = task_grq_lock(p, &flags);
+ 	cpu = task_cpu(p);
+ 
+-	/* state is a volatile long, どうして、分からない */
++	/* state is a volatile long, 銇┿亞銇椼仸銆佸垎銇嬨倝銇亜 */
+ 	if (!((unsigned int)p->state & state))
+ 		goto out_unlock;
+ 
+@@ -2815,7 +2859,7 @@ static void task_running_tick(struct rq
+ 	 * Tasks that were scheduled in the first half of a tick are not
+ 	 * allowed to run into the 2nd half of the next tick if they will
+ 	 * run out of time slice in the interim. Otherwise, if they have
+-	 * less than RESCHED_US μs of time slice left they will be rescheduled.
++	 * less than RESCHED_US 渭s of time slice left they will be rescheduled.
+ 	 */
+ 	if (rq->dither) {
+ 		if (rq->rq_time_slice > HALF_JIFFY_US)
+@@ -3022,6 +3066,20 @@ found_middle:
+ 	return result + __ffs(tmp);
+ }
+ 
++static inline void swap_queue(struct list_head *queue)
++{
++	struct task_struct *p, *next;
++
++	if(!list_is_singular(queue) && likely(!list_empty(queue))) {
++		p = (struct task_struct *)list_first_entry(queue, struct task_struct, run_list);
++		next = (struct task_struct *)list_first_entry(&p->run_list, struct task_struct, run_list);
++		if (deadline_before(next->deadline, p->deadline)) {
++			list_del(&next->run_list);
++			list_add(&next->run_list, queue);
++		}
++	}
++}
++
+ /*
+  * O(n) lookup of all tasks in the global runqueue. The real brainfuck
+  * of lock contention and O(n). It's not really O(n) as only the queued,
+@@ -3045,15 +3103,18 @@ task_struct *earliest_deadline_task(stru
+ {
+ 	struct task_struct *edt = NULL;
+ 	unsigned long idx = -1;
++	struct list_head *queue;
++	struct task_struct *p;
++	u64 earliest_deadline;
+ 
++	earliest_deadline = ~0ULL;
+ 	do {
+-		struct list_head *queue;
+-		struct task_struct *p;
+-		u64 earliest_deadline;
+-
+ 		idx = next_sched_bit(grq.prio_bitmap, ++idx);
+-		if (idx >= PRIO_LIMIT)
++		if (idx >= PRIO_LIMIT) {
++			if(edt)
++				goto out_take;
+ 			return idle;
++		}
+ 		queue = grq.queue + idx;
+ 
+ 		if (idx < MAX_RT_PRIO) {
+@@ -3072,11 +3133,7 @@ task_struct *earliest_deadline_task(stru
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * No rt tasks. Find the earliest deadline task. Now we're in
+-		 * O(n) territory.
+-		 */
+-		earliest_deadline = ~0ULL;
++		swap_queue(queue);
+ 		list_for_each_entry(p, queue, run_list) {
+ 			u64 dl;
+ 
+@@ -3102,8 +3159,10 @@ task_struct *earliest_deadline_task(stru
+ 				earliest_deadline = dl;
+ 				edt = p;
+ 			}
++
++			break;
+ 		}
+-	} while (!edt);
++	} while (1);
+ 
+ out_take:
+ 	take_task(cpu, edt);
+@@ -4646,7 +4705,7 @@ static inline bool should_resched(void)
+ 
+ static void __cond_resched(void)
+ {
+-	/* NOT a real fix but will make voluntary preempt work. 馬鹿な事 */
++	/* NOT a real fix but will make voluntary preempt work. 棣箍銇簨 */
+ 	if (unlikely(system_state != SYSTEM_RUNNING))
+ 		return;
